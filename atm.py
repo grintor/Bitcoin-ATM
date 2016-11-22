@@ -20,10 +20,22 @@ from_cam = multiprocessing.JoinableQueue(1)
 
 cashAcceptorOn = False # global variable to tell acceptCash() if it should keep looping or not
 
+# variable things =================
+
+moneyDiv = 5
+secretKey = "BitcoinsFTW!"
+orxKey = "abc1234"
+machineID = 333
+dispenserLowThreashold = 4
+maxDeposit = 1200	 # max dollars which can be inserted, must be smaller than 256*moneyDiv
+tickerPrice = 0 # global variable to store price in, needs to init as 0
+
+# / variable things ===============
+
 # SSP Stuff ================================
 
 CashDrop = serial.Serial(port='/dev/ttyAMA0', baudrate=9600, timeout=1)
-SSPrecycleChannel = 2
+SSPrecycleChannel = 6 # 6 means recycle 100's
 seqStateSSP = 0x00
 channelValue        = [999, 0, 5, 10, 20, 50, 100, 0, 0, 0, 0, 0, 0, 0, 0, 0]
 moneyCount = 0
@@ -52,6 +64,8 @@ fraudAttempt    = False  # someone tried to break in
 # / SSP Stuff ================================
 
 def main():
+	global tickerPrice
+	getPrices()
 	to_cam.put('start')	# start the camera
 	checkQR()
 	
@@ -122,42 +136,11 @@ def scanQR():
 						print "camera stopped"
 					to_cam.task_done()
 					
-					
-def checkQR():
-	if not from_cam.empty():				# if we have a QR code...
-		code = from_cam.get() 				# get it
-		processQRCode(code)					# use it!
-		from_cam.task_done()				# allow from_cam.put() to return in the other process
-	else:
-		checkQR_thread = Timer(0.2, checkQR) # if we don't have one, check for one later
-		checkQR_thread.start()
-		
-def processQRCode(code):
-	print "The QR Code says " + code
-	if is_valid_bitcoin_address(code):
-		print "this is a bitcoin address"
-		giveBTC(code)
-	elif is_valid_wif(code):
-		print "this is a private key"
-		takeBTC(code)
-	else:
-		print "this is not a bitcoin address or private key"
-		
-def takeBTC(privateKey):
-	print "the corrasponding address is: " + wif2address(privateKey)
-	print "the balance at that address is: " , getBalance(wif2address(privateKey)) , " satoshi"
-	
-def getBalance(address):
-	blockchainAddressInfoURL = "https://blockchain.info/address/" + address + "?format=json"
-	try:
-		blockchainAddressInfo = json.load(urllib.urlopen(blockchainAddressInfoURL))
-		addressBallance = blockchainAddressInfo["final_balance"]
-		return addressBallance
-	except:
-		return 0
-	
 
-def giveBTC(address):
+					
+					
+def getPrices():
+	global tickerPrice
 	tickerCoinbaseURL = "https://api.coinbase.com/v2/prices/BTC-USD/buy"
 	try:
 		tickerCoinbase = json.load(urllib.urlopen(tickerCoinbaseURL))
@@ -182,26 +165,92 @@ def giveBTC(address):
 	tickerPriceList = [tickerBitStampPrice, tickerCoinbasePrice, tickerBTCePrice]
 	tickerPrice = statistics.median(tickerPriceList)
 	if tickerPrice == 0:
-		print "failed to fetch two or more price sources, abort"
+		print "failed to fetch two or more price sources, retrying in 10 seconds"
+		time.sleep(10)
+		getPrices()
 	else:
-		print "We are using:   " , tickerPrice
-		cashAcceptorOn = True
-		acceptCash()
-		print "cash acceptor is on"
-		time.sleep(2) # need to give them time to pull their phone away fromt the camera
-		to_cam.put('start')
-		from_cam.get() # this is blocking! we wait now for a QR code.
-		cashAcceptorOn = False
-		print "cash acceptor is off"
-		if moneyCount == 0:
-			print "canceling..."
-		else:
-			btcToSend = round((moneyCount / tickerPrice), 8)
-			print "got $", moneyCount
-			print "sending " , btcToSend , "bitcoins to: " , address
-		time.sleep(2) # need to give them time to pull their phone away from the camera
-		moneyCount = 0; # reset for the next person
-		to_cam.put('start') # reset for the next person
+		print "Got price. We are using:   " , tickerPrice
+		getPrices_thread = Timer(90, getPrices) # get prices again in 90 seconds
+		getPrices_thread.start()
+
+
+def checkQR():
+	if not from_cam.empty():				# if we have a QR code...
+		code = from_cam.get() 				# get it
+		processQRCode(code)					# use it!
+		from_cam.task_done()				# allow from_cam.put() to return in the other process
+	else:
+		checkQR_thread = Timer(0.2, checkQR) # if we don't have one, check for one later
+		checkQR_thread.start()
+		
+def processQRCode(code):
+	print "The QR Code says " + code
+	if is_valid_bitcoin_address(code):
+		print "this is a bitcoin address"
+		giveBTC(code)
+	elif is_valid_wif(code):
+		print "this is a private key"
+		takeBTC(code)
+	else:
+		print "this is not a bitcoin address or private key"
+		
+def takeBTC(privateKey):
+	global tickerPrice
+	address = wif2address(privateKey)
+	balance = getBalance(wif2address(privateKey))
+	dollars = round((balance * tickerPrice),2)
+	billValue = channelValue[SSPrecycleChannel]
+	print "the corrasponding address is: " + address
+	print "the balance at that address is: " , balance , " bitcoin"
+	print "which is $" , dollars
+	if dollars < billValue:
+		print "doing nothing. minimum $" , billValue
+	else:
+		toDispenseBills = math.trunc(dollars / billValue)
+		toDispenseValue = toDispenseBills * billValue
+		toReturnDollars = round((dollars - toDispenseValue),2)
+		toReturnBitcoin = round((toReturnDollars / tickerPrice),8)
+		print "dispensing $" , toDispenseValue , " which is " , toDispenseBills , "bills"
+		print "sending $" , toReturnDollars , " which is " , toReturnBitcoin , " BTC to: " , address
+		
+	
+def getBalance(address):
+	blockchainAddressInfoURL = "https://blockchain.info/address/" + address + "?format=json"
+	try:
+		blockchainAddressInfo = json.load(urllib.urlopen(blockchainAddressInfoURL))
+		addressBallance = blockchainAddressInfo["final_balance"]
+		return addressBallance / 100000000
+	except:
+		return 0
+	
+
+def giveBTC(address):
+	global cashAcceptorOn
+	global moneyCount
+	global tickerPrice
+	cashAcceptorOn = True
+	SSPsetup()
+	setChannelInhibits()
+	SSPcommunicate(SSP_enable)
+	acceptCash()
+	print "cash acceptor is on"
+	time.sleep(2) # need to give them time to pull their phone away fromt the camera
+	to_cam.put('start')
+	try:
+		from_cam.get(True, 90) # this is blocking for 90 seconds while we wait now for a QR code.
+	except:
+		print "cam timeout"
+	cashAcceptorOn = False
+	print "cash acceptor is off"
+	if moneyCount == 0:
+		print "canceling..."
+	else:
+		btcToSend = round((moneyCount / tickerPrice), 8)
+		print "got $", moneyCount
+		print "sending " , btcToSend , "bitcoins to: " , address
+	time.sleep(2) # need to give them time to pull their phone away from the camera
+	moneyCount = 0; # reset for the next person
+	to_cam.put('start') # reset for the next person
 			
 		
 def acceptCash():
@@ -337,6 +386,7 @@ def SSPinterpret():
 	global decodeBufferSSP
 	SSPcommunicate(SSP_poll)
 	lastSSPpollResponse = decodeBufferSSP[4]
+	#print "lastSSPpollResponse: ", lastSSPpollResponse
 	if (decodeBufferSSP[4] == 0xEE):   # 0xEE means they put money in and it was accepted
 		moneyCount += channelValue[decodeBufferSSP[5]]  # byte 5 has the channel number of accepted bill
 		setChannelInhibits() # disable channels which would allow the user to go over maxDeposit
