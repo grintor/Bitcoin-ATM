@@ -14,6 +14,7 @@ import statistics
 import serial
 import array
 import time
+import math
 
 to_cam = multiprocessing.JoinableQueue(1)
 from_cam = multiprocessing.JoinableQueue(1)
@@ -22,12 +23,8 @@ cashAcceptorOn = False # global variable to tell acceptCash() if it should keep 
 
 # variable things =================
 
-moneyDiv = 5
-secretKey = "BitcoinsFTW!"
-orxKey = "abc1234"
-machineID = 333
 dispenserLowThreashold = 4
-maxDeposit = 1200	 # max dollars which can be inserted, must be smaller than 256*moneyDiv
+maxDeposit = 1200	 # max dollars which can be inserted
 tickerPrice = 0 # global variable to store price in, needs to init as 0
 
 # / variable things ===============
@@ -35,7 +32,7 @@ tickerPrice = 0 # global variable to store price in, needs to init as 0
 # SSP Stuff ================================
 
 CashDrop = serial.Serial(port='/dev/ttyAMA0', baudrate=9600, timeout=1)
-SSPrecycleChannel = 6 # 6 means recycle 100's
+SSPrecycleChannel = 4 # 6 means recycle 100's
 seqStateSSP = 0x00
 channelValue        = [999, 0, 5, 10, 20, 50, 100, 0, 0, 0, 0, 0, 0, 0, 0, 0]
 moneyCount = 0
@@ -64,8 +61,8 @@ fraudAttempt    = False  # someone tried to break in
 # / SSP Stuff ================================
 
 def main():
-	global tickerPrice
 	getPrices()
+	#takeBTC("5J1eoZFeNZf9r9JAxVST32MZngiW2onFC1nrcP4CcFtEQaG5yKs")
 	to_cam.put('start')	# start the camera
 	checkQR()
 	
@@ -126,6 +123,7 @@ def scanQR():
 							from_cam.put(str(symbol.data))
 						camera.stop_preview()
 						loop = False
+						print "camera stopped by QR capture"
 						break
 				# stop if told
 				if not to_cam.empty():
@@ -133,7 +131,7 @@ def scanQR():
 					if todo == 'stop':
 						camera.stop_preview()
 						loop = False
-						print "camera stopped"
+						print "camera stopped by command"
 					to_cam.task_done()
 					
 
@@ -170,18 +168,17 @@ def getPrices():
 		getPrices()
 	else:
 		print "Got price. We are using:   " , tickerPrice
-		getPrices_thread = Timer(90, getPrices) # get prices again in 90 seconds
+		getPrices_thread = Timer(120, getPrices) # get prices again in 120 seconds
 		getPrices_thread.start()
 
 
 def checkQR():
-	if not from_cam.empty():				# if we have a QR code...
-		code = from_cam.get() 				# get it
-		processQRCode(code)					# use it!
-		from_cam.task_done()				# allow from_cam.put() to return in the other process
-	else:
-		checkQR_thread = Timer(0.2, checkQR) # if we don't have one, check for one later
-		checkQR_thread.start()
+	if not from_cam.empty():				 # if we have a QR code...
+		code = from_cam.get() 				 # get it
+		processQRCode(code)					 # use it!
+		from_cam.task_done()				 # allow from_cam.put() to return in the other process
+	checkQR_thread = Timer(0.2, checkQR)     # check for one again later
+	checkQR_thread.start()
 		
 def processQRCode(code):
 	print "The QR Code says " + code
@@ -196,23 +193,35 @@ def processQRCode(code):
 		
 def takeBTC(privateKey):
 	global tickerPrice
+	global moneyCount
 	address = wif2address(privateKey)
-	balance = getBalance(wif2address(privateKey))
-	dollars = round((balance * tickerPrice),2)
+	addressBalance = getBalance(wif2address(privateKey))
+	addressBalance = 0.1
+	insertedDollars = round((addressBalance * tickerPrice),2)
 	billValue = channelValue[SSPrecycleChannel]
-	print "the corrasponding address is: " + address
-	print "the balance at that address is: " , balance , " bitcoin"
-	print "which is $" , dollars
-	if dollars < billValue:
+	print "the corresponding address is: " + address
+	print "the balance at that address is: " , addressBalance , " bitcoin"
+	print "which is $" , insertedDollars
+	if insertedDollars < billValue:
 		print "doing nothing. minimum $" , billValue
 	else:
-		toDispenseBills = math.trunc(dollars / billValue)
+		toDispenseBills = math.trunc(insertedDollars / billValue)
 		toDispenseValue = toDispenseBills * billValue
-		toReturnDollars = round((dollars - toDispenseValue),2)
+		toReturnDollars = round((insertedDollars - toDispenseValue),2)
+		toTakeBitcoin = toDispenseValue / tickerPrice
 		toReturnBitcoin = round((toReturnDollars / tickerPrice),8)
-		print "dispensing $" , toDispenseValue , " which is " , toDispenseBills , "bills"
-		print "sending $" , toReturnDollars , " which is " , toReturnBitcoin , " BTC to: " , address
-		
+		print "dispensing $" , toDispenseValue , " which is " , toDispenseBills , "bills and keeping " , toTakeBitcoin , " Bitcoin"
+		print "sent " , toReturnBitcoin , " BTC to: " , address, " which is $" , toReturnDollars
+		moneyCount = toDispenseBills
+		if not SSPdispense():
+			dollarsOwed = moneyCount * billValue
+			bitcoinOwed = dollarsOwed / tickerPrice
+			print "we were not able to dispense enough. we still owe $" , dollarsOwed
+			print "sent " , bitcoinOwed , " BTC to " , address
+		else: 
+			print "done. money dispensed"
+			moneyCount = 0; # reset for the next person
+			to_cam.put('start') # reset for the next person
 	
 def getBalance(address):
 	blockchainAddressInfoURL = "https://blockchain.info/address/" + address + "?format=json"
@@ -234,7 +243,7 @@ def giveBTC(address):
 	SSPcommunicate(SSP_enable)
 	acceptCash()
 	print "cash acceptor is on"
-	time.sleep(2) # need to give them time to pull their phone away fromt the camera
+	time.sleep(2) # need to give them time to pull their phone away from the camera
 	to_cam.put('start')
 	try:
 		from_cam.get(True, 90) # this is blocking for 90 seconds while we wait now for a QR code.
@@ -243,7 +252,7 @@ def giveBTC(address):
 	cashAcceptorOn = False
 	print "cash acceptor is off"
 	if moneyCount == 0:
-		print "canceling..."
+		print " no money inserted. canceling..."
 	else:
 		btcToSend = round((moneyCount / tickerPrice), 8)
 		print "got $", moneyCount
