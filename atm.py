@@ -5,8 +5,11 @@ import zbar
 from PIL import Image
 from threading import Timer
 from hashlib import sha256
-from pycoin.encoding import is_valid_wif, public_pair_to_bitcoin_address, is_valid_bitcoin_address, wif_to_secret_exponent
-from pycoin.ecdsa import generator_secp256k1, public_pair_for_secret_exponent
+from pycoin.key import Key
+from pycoin.encoding import is_valid_wif, is_valid_bitcoin_address
+from pycoin.services import spendables_for_address
+from pycoin.tx.tx_utils import create_signed_tx
+from pycoin.services.blockchain_info import BlockchainInfoProvider
 
 import urllib
 import json
@@ -15,16 +18,23 @@ import serial
 import array
 import time
 import math
+import os
+import sys
+import shelve
 
 to_cam = multiprocessing.JoinableQueue(1)
 from_cam = multiprocessing.JoinableQueue(1)
 
+
+os.environ["PYCOIN_BTC_PROVIDERS"] = "blockchain.info blockr.io blockexplorer.com"
+
+ourPrivateKey = "000000000000000000000000000000000000000000000000000"
 cashAcceptorOn = False # global variable to tell acceptCash() if it should keep looping or not
 
 # variable things =================
 
 dispenserLowThreashold = 4
-maxDeposit = 1200	 # max dollars which can be inserted
+maxDeposit = 0	 # max dollars which can be inserted, this will change based on our wallet ballance
 tickerPrice = 0 # global variable to store price in, needs to init as 0
 
 # / variable things ===============
@@ -32,9 +42,9 @@ tickerPrice = 0 # global variable to store price in, needs to init as 0
 # SSP Stuff ================================
 
 CashDrop = serial.Serial(port='/dev/ttyAMA0', baudrate=9600, timeout=1)
-SSPrecycleChannel = 4 # 6 means recycle 100's
+SSPrecycleChannel = 1 # 6 means recycle 100's
 seqStateSSP = 0x00
-channelValue        = [999, 0, 5, 10, 20, 50, 100, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+channelValue        = [999, 1, 5, 10, 20, 50, 100, 0, 0, 0, 0, 0, 0, 0, 0, 0]
 moneyCount = 0
 lastSSPpollResponse = 0x00
 
@@ -61,8 +71,8 @@ fraudAttempt    = False  # someone tried to break in
 # / SSP Stuff ================================
 
 def main():
+	#processSendBitcoin("5J1eoZFeNZf9r9JAxVST32MZngiW2onFC1nrcP4CcFtEQaG5yKs", "1EddmKAfM3osNFPK5RLxeiCjZEUnz76idq", 0.001)
 	getPrices()
-	#takeBTC("5J1eoZFeNZf9r9JAxVST32MZngiW2onFC1nrcP4CcFtEQaG5yKs")
 	to_cam.put('start')	# start the camera
 	checkQR()
 	
@@ -139,6 +149,18 @@ def scanQR():
 					
 def getPrices():
 	global tickerPrice
+	global maxDeposit
+	global ourPrivateKey
+	ourAddress = wif2address(ourPrivateKey)
+	ourBalance = getBalance(ourAddress)
+	if ourBalance == 0:
+		print "failed to fetch our balance, retrying in 10 seconds"
+		time.sleep(10)
+		getPrices()
+		return
+	else:
+		print "our balance is ", ourBalance, " BTC."
+		ourBalance = ourBalance - 0.0001 # minus some fee
 	tickerCoinbaseURL = "https://api.coinbase.com/v2/prices/BTC-USD/buy"
 	try:
 		tickerCoinbase = json.load(urllib.urlopen(tickerCoinbaseURL))
@@ -166,9 +188,12 @@ def getPrices():
 		print "failed to fetch two or more price sources, retrying in 10 seconds"
 		time.sleep(10)
 		getPrices()
+		return
 	else:
 		print "Got price. We are using:   " , tickerPrice
 		getPrices_thread = Timer(120, getPrices) # get prices again in 120 seconds
+		maxDeposit = int(tickerPrice * ourBalance)
+		print "maxDeposit has been set to ", maxDeposit
 		getPrices_thread.start()
 
 
@@ -185,51 +210,104 @@ def processQRCode(code):
 	if is_valid_bitcoin_address(code):
 		print "this is a bitcoin address"
 		giveBTC(code)
+		to_cam.put('start') # reset for the next person
 	elif is_valid_wif(code):
 		print "this is a private key"
 		takeBTC(code)
+		to_cam.put('start') # reset for the next person
 	else:
 		print "this is not a bitcoin address or private key"
 		
 def takeBTC(privateKey):
 	global tickerPrice
 	global moneyCount
+	global ourPrivateKey
 	address = wif2address(privateKey)
-	addressBalance = getBalance(wif2address(privateKey))
-	addressBalance = 0.1
+	ourAddress = wif2address(ourPrivateKey)
+	addressBalance = getBalance(address)
 	insertedDollars = round((addressBalance * tickerPrice),2)
 	billValue = channelValue[SSPrecycleChannel]
-	print "the corresponding address is: " + address
-	print "the balance at that address is: " , addressBalance , " bitcoin"
-	print "which is $" , insertedDollars
-	if insertedDollars < billValue:
-		print "doing nothing. minimum $" , billValue
+	
+	txdb = shelve.open("txdb.shelve")
+	if txdb.has_key(address):
+		if txConfirmed(txdb[address]['tx']):
+			print "the tx has been confirmed"
+			moneyCount = txdb[address]['toDispenseBills']
+			if not SSPdispense():
+				dollarsOwed = moneyCount * billValue
+				bitcoinOwed = dollarsOwed / tickerPrice
+				print "we were not able to dispense enough. we still owe $" , dollarsOwed
+				print "sent " , bitcoinOwed , " BTC to " , address
+				print "tx: ", processSendBitcoin(ourPrivateKey, address, bitcoinOwed)
+			else: 
+				print "done. money dispensed"
+			del txdb[address]
+			txdb.close()
+			return
+		else:
+			print "we are still waiting on a confirmation for a transaction for that address"
+			txdb.close()
+			return
 	else:
+		print "the corresponding address is: " + address
+		print "the balance at that address is: " , addressBalance , " bitcoin"
+		print "which is $" , insertedDollars
+		if insertedDollars < billValue:
+			print "doing nothing. minimum $" , billValue
+			return
 		toDispenseBills = math.trunc(insertedDollars / billValue)
 		toDispenseValue = toDispenseBills * billValue
 		toReturnDollars = round((insertedDollars - toDispenseValue),2)
-		toTakeBitcoin = toDispenseValue / tickerPrice
+		toTakeBitcoin = round(toDispenseValue / tickerPrice)
 		toReturnBitcoin = round((toReturnDollars / tickerPrice),8)
-		print "dispensing $" , toDispenseValue , " which is " , toDispenseBills , "bills and keeping " , toTakeBitcoin , " Bitcoin"
+		tx = processSendBitcoin(privateKey, ourAddress, toTakeBitcoin)
+		if tx:
+			txdb = shelve.open("txdb.shelve")
+			txdb[address] = {'tx':tx, 'toDispenseBills':toDispenseBills}
+			txdb.close()
+			print "now waiting for confirmation"
+		else:
+			print "need to figure out how to handle failed tx"
+		print "after confirmation, dispensing $" , toDispenseValue , " which is " , toDispenseBills , "bills and keeping " , toTakeBitcoin , " Bitcoin"
 		print "sent " , toReturnBitcoin , " BTC to: " , address, " which is $" , toReturnDollars
-		moneyCount = toDispenseBills
-		if not SSPdispense():
-			dollarsOwed = moneyCount * billValue
-			bitcoinOwed = dollarsOwed / tickerPrice
-			print "we were not able to dispense enough. we still owe $" , dollarsOwed
-			print "sent " , bitcoinOwed , " BTC to " , address
-		else: 
-			print "done. money dispensed"
-			moneyCount = 0; # reset for the next person
-			to_cam.put('start') # reset for the next person
-	
+		txdb.close()
+
+def processSendBitcoin(fromPrivateKey, toPublicKey, amountOfBitcoin):
+	bcip = BlockchainInfoProvider("BTC")
+	amountOfSatoshi = amountOfBitcoin * 100000000
+	spendables = spendables_for_address(wif2address(fromPrivateKey), "BTC")
+	try:
+		tx = create_signed_tx(spendables, [(toPublicKey, amountOfSatoshi), wif2address(fromPrivateKey)], [fromPrivateKey], 0.0004)
+	except Exception as e:
+		print "could not build transaction."
+		print e
+		return False
+	try:
+		bcip.broadcast_tx(tx)
+		print "tx broadcasted: ", tx.id()
+		return tx.id()
+	except:
+		print "tx failed to be broadcasted"
+		return False
+
+def txConfirmed(tx):
+	blockchainAddressInfoURL = "https://blockchain.info/rawtx/" + tx + "?format=json"
+	try:
+		blockchainAddressInfo = json.load(urllib.urlopen(blockchainAddressInfoURL))
+		if 'block_height' in blockchainAddressInfo:
+			return True
+	except:
+		pass
+	return False
+
 def getBalance(address):
 	blockchainAddressInfoURL = "https://blockchain.info/address/" + address + "?format=json"
 	try:
 		blockchainAddressInfo = json.load(urllib.urlopen(blockchainAddressInfoURL))
-		addressBallance = blockchainAddressInfo["final_balance"]
-		return addressBallance / 100000000
-	except:
+		addressBallance = float(blockchainAddressInfo['final_balance'])
+		return round((addressBallance / 100000000),8)
+	except Exception as e:
+		print "error fetching balance:", e
 		return 0
 	
 
@@ -237,6 +315,7 @@ def giveBTC(address):
 	global cashAcceptorOn
 	global moneyCount
 	global tickerPrice
+	global ourPrivateKey
 	cashAcceptorOn = True
 	SSPsetup()
 	setChannelInhibits()
@@ -257,9 +336,9 @@ def giveBTC(address):
 		btcToSend = round((moneyCount / tickerPrice), 8)
 		print "got $", moneyCount
 		print "sending " , btcToSend , "bitcoins to: " , address
+		processSendBitcoin(ourPrivateKey, address, btcToSend)
 	time.sleep(2) # need to give them time to pull their phone away from the camera
 	moneyCount = 0; # reset for the next person
-	to_cam.put('start') # reset for the next person
 			
 		
 def acceptCash():
@@ -271,9 +350,8 @@ def acceptCash():
 		SSPcommunicate(SSP_disable)
 		
 def wif2address(wif):
-	secret_exponent = wif_to_secret_exponent(wif)
-	public_pair = public_pair_for_secret_exponent(generator_secp256k1, secret_exponent)
-	return public_pair_to_bitcoin_address(public_pair, False)
+	private_key = Key.from_text(wif);
+	return str(private_key.address())
 
 		
 # SSP functions =========================================
@@ -320,13 +398,16 @@ def SSPcheck(decodeBufferSSP):
 			while i < decodeBufferSSP[2] + 3:
 				checksum = culCalcCRC(decodeBufferSSP[i], checksum)
 				i += 1
-			if decodeBufferSSP[decodeBufferSSP[2] + 3] != (checksum & 0x00ff):
-				return False
-			else:
-				if decodeBufferSSP[decodeBufferSSP[2] + 4] != ((checksum & 0xff00) >> 8):
+			try: # we can't trust decodeBufferSSP[2] to provide us a valid array index, so we plan for the worst.
+				if decodeBufferSSP[decodeBufferSSP[2] + 3] != (checksum & 0x00ff):
 					return False
 				else:
-					return True
+					if decodeBufferSSP[decodeBufferSSP[2] + 4] != ((checksum & 0xff00) >> 8):
+						return False
+					else:
+						return True
+			except:
+				return False
 
 def SSPreceive():
 	global decodeBufferSSP
