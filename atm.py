@@ -8,8 +8,9 @@ from hashlib import sha256
 from pycoin.key import Key
 from pycoin.encoding import is_valid_wif, is_valid_bitcoin_address
 from pycoin.services import spendables_for_address
-from pycoin.tx.tx_utils import create_signed_tx
+from pycoin.tx.tx_utils import create_signed_tx, create_tx
 from pycoin.services.blockchain_info import BlockchainInfoProvider
+from pycoin.convention import tx_fee
 
 import urllib
 import json
@@ -21,15 +22,25 @@ import math
 import os
 import sys
 import shelve
+from collections import defaultdict
 
+tx_fee.TX_FEE_PER_THOUSAND_BYTES = 0
 to_cam = multiprocessing.JoinableQueue(1)
 from_cam = multiprocessing.JoinableQueue(1)
 
 
 os.environ["PYCOIN_BTC_PROVIDERS"] = "blockchain.info blockr.io blockexplorer.com"
 
-ourPrivateKey = "000000000000000000000000000000000000000000000000000"
+ourPrivateKey = "KzFEXXc1F3U1234567896cyHvnLMieFRT2oWMnW6tqx6G2"
 cashAcceptorOn = False # global variable to tell acceptCash() if it should keep looping or not
+
+txdb = shelve.open("txdb.shelve", writeback=True)
+if 'receiving' not in txdb:
+	print "the txdb doesn't exist. building it now"
+	txdb['receiving'] = defaultdict(dict)
+	txdb['pending'] = defaultdict(dict)
+	txdb['pending']['receiving'] = defaultdict(dict)
+	txdb['pending']['sending'] = defaultdict(dict)
 
 # variable things =================
 
@@ -71,10 +82,28 @@ fraudAttempt    = False  # someone tried to break in
 # / SSP Stuff ================================
 
 def main():
-	#processSendBitcoin("5J1eoZFeNZf9r9JAxVST32MZngiW2onFC1nrcP4CcFtEQaG5yKs", "1EddmKAfM3osNFPK5RLxeiCjZEUnz76idq", 0.001)
+	getTxFee()
+	processPendingTx()
 	getPrices()
 	to_cam.put('start')	# start the camera
 	checkQR()
+	
+def getTxFee():
+	try:
+		tx_fee.TX_FEE_PER_THOUSAND_BYTES = int(json.load(urllib.urlopen('https://api.blockchain.info/fees'))['estimate'][0]['fee'])
+	except:
+		pass
+	if tx_fee.TX_FEE_PER_THOUSAND_BYTES == 0:
+		print "failed to get tx fee, trying again in 10 seconds"
+		time.sleep(10)
+		getTxFee()
+		return
+	else:
+		getTxFee_thread = Timer(600, getPrices) # get getTxFee again in 120 seconds
+		print "tx fee has been set to ", tx_fee.TX_FEE_PER_THOUSAND_BYTES
+		getTxFee_thread.daemon = True
+		getTxFee_thread.start()
+	
 	
 # This is the constructor for the subpreocess which will control the camera and scan for QRs
 def scanQR():
@@ -183,17 +212,19 @@ def getPrices():
 		tickerBTCePrice = 0
 	print "btc-e price:    " , tickerBTCePrice
 	tickerPriceList = [tickerBitStampPrice, tickerCoinbasePrice, tickerBTCePrice]
-	tickerPrice = statistics.median(tickerPriceList)
-	if tickerPrice == 0:
+	pendingTickerPrice = statistics.median(tickerPriceList)
+	if pendingTickerPrice == 0:
 		print "failed to fetch two or more price sources, retrying in 10 seconds"
 		time.sleep(10)
 		getPrices()
 		return
 	else:
-		print "Got price. We are using:   " , tickerPrice
-		getPrices_thread = Timer(120, getPrices) # get prices again in 120 seconds
+		print "Got price. We are using:   " , pendingTickerPrice
+		tickerPrice = pendingTickerPrice
 		maxDeposit = int(tickerPrice * ourBalance)
 		print "maxDeposit has been set to ", maxDeposit
+		getPrices_thread = Timer(120, getPrices) # get prices again in 120 seconds
+		getPrices_thread.daemon = True
 		getPrices_thread.start()
 
 
@@ -203,6 +234,7 @@ def checkQR():
 		processQRCode(code)					 # use it!
 		from_cam.task_done()				 # allow from_cam.put() to return in the other process
 	checkQR_thread = Timer(0.2, checkQR)     # check for one again later
+	checkQR_thread.daemon = True
 	checkQR_thread.start()
 		
 def processQRCode(code):
@@ -211,6 +243,7 @@ def processQRCode(code):
 		print "this is a bitcoin address"
 		giveBTC(code)
 		to_cam.put('start') # reset for the next person
+		camera.start_preview()
 	elif is_valid_wif(code):
 		print "this is a private key"
 		takeBTC(code)
@@ -218,38 +251,44 @@ def processQRCode(code):
 	else:
 		print "this is not a bitcoin address or private key"
 		
-def takeBTC(privateKey):
+def takeBTC(theirPrivateKey):
 	global tickerPrice
 	global moneyCount
 	global ourPrivateKey
-	address = wif2address(privateKey)
-	ourAddress = wif2address(ourPrivateKey)
-	addressBalance = getBalance(address)
+	global txdb
+	theirAddress = wif2address(theirPrivateKey)
+	addressBalance = getBalance(theirAddress)
 	insertedDollars = round((addressBalance * tickerPrice),2)
 	billValue = channelValue[SSPrecycleChannel]
 	
-	txdb = shelve.open("txdb.shelve")
-	if txdb.has_key(address):
-		if txConfirmed(txdb[address]['tx']):
+	if theirAddress in txdb['receiving']:
+		if txConfirmed(txdb['receiving'][theirAddress]['tx']):
 			print "the tx has been confirmed"
-			moneyCount = txdb[address]['toDispenseBills']
+			moneyCount = txdb['receiving'][theirAddress]['toDispenseBills']
+			txdb.sync()
 			if not SSPdispense():
 				dollarsOwed = moneyCount * billValue
 				bitcoinOwed = dollarsOwed / tickerPrice
 				print "we were not able to dispense enough. we still owe $" , dollarsOwed
-				print "sent " , bitcoinOwed , " BTC to " , address
-				print "tx: ", processSendBitcoin(ourPrivateKey, address, bitcoinOwed)
+				print "sent " , bitcoinOwed , " BTC to " , theirAddress
+				tx = processSendBitcoin(ourPrivateKey, theirAddress, bitcoinOwed)
+				if tx:
+					print "tx: ", tx
+				else:
+					txdb['pending']['sending'][theirAddress] = defaultdict(dict)
+					txdb['pending']['sending'][theirAddress]['bitcoinOwed'] = bitcoinOwed
+					txdb.sync()
+					print "Couldn't process tx. Will try again in 120 seconds"
 			else: 
 				print "done. money dispensed"
-			del txdb[address]
-			txdb.close()
+			del txdb['receiving'][theirAddress]
+			txdb.sync()
 			return
 		else:
 			print "we are still waiting on a confirmation for a transaction for that address"
-			txdb.close()
 			return
 	else:
-		print "the corresponding address is: " + address
+		print "the corresponding address is: " + theirAddress
 		print "the balance at that address is: " , addressBalance , " bitcoin"
 		print "which is $" , insertedDollars
 		if insertedDollars < billValue:
@@ -260,24 +299,64 @@ def takeBTC(privateKey):
 		toReturnDollars = round((insertedDollars - toDispenseValue),2)
 		toTakeBitcoin = round(toDispenseValue / tickerPrice)
 		toReturnBitcoin = round((toReturnDollars / tickerPrice),8)
-		tx = processSendBitcoin(privateKey, ourAddress, toTakeBitcoin)
-		if tx:
-			txdb = shelve.open("txdb.shelve")
-			txdb[address] = {'tx':tx, 'toDispenseBills':toDispenseBills}
-			txdb.close()
-			print "now waiting for confirmation"
-		else:
-			print "need to figure out how to handle failed tx"
 		print "after confirmation, dispensing $" , toDispenseValue , " which is " , toDispenseBills , "bills and keeping " , toTakeBitcoin , " Bitcoin"
-		print "sent " , toReturnBitcoin , " BTC to: " , address, " which is $" , toReturnDollars
-		txdb.close()
+		print "sent " , toReturnBitcoin , " BTC to: " , theirAddress, " which is $" , toReturnDollars
+		# make sure we are not taking more than they actually have (after standard tx fee applied)
+		stdTxFee = (tx_fee.TX_FEE_PER_THOUSAND_BYTES / 100000000)
+		if (toTakeBitcoin + stdTxFee) > addressBalance:
+			toTakeBitcoin = addressBalance - stdTxFee
+		processTakeBTC(theirPrivateKey, toTakeBitcoin, toDispenseBills)
+
+def processTakeBTC(theirPrivateKey, toTakeBitcoin, toDispenseBills):
+	global txdb
+	global ourPrivateKey
+	theirAddress = wif2address(theirPrivateKey)
+	tx = processSendBitcoin(theirPrivateKey, wif2address(ourPrivateKey), toTakeBitcoin)
+	if tx:
+		txdb['receiving'][theirAddress] = {'tx':tx, 'toDispenseBills':toDispenseBills}
+		txdb.sync()
+		print "now waiting for confirmation"
+	else:
+		txdb['pending']['receiving'][theirAddress] = defaultdict(dict)
+		txdb['pending']['receiving'][theirAddress]['theirPrivateKey'] = theirPrivateKey
+		txdb['pending']['receiving'][theirAddress]['toTakeBitcoin'] = toTakeBitcoin
+		txdb.sync()
+		print "couldn't make the transaction right now, will try again in 120 seconds"
+		
+def processPendingTx():
+	global txdb
+	global ourPrivateKey
+	for theirAddress, v in txdb['pending']['receiving'].items():
+		ourAddress = wif2address(ourPrivateKey)
+		print v['theirPrivateKey'] , '.' , ourAddress , '.' , v['toTakeBitcoin']
+		tx = processSendBitcoin(v['theirPrivateKey'], ourAddress, v['toTakeBitcoin'])
+		if tx:
+			txdb['receiving'][theirAddress] = {'tx':tx, 'toDispenseBills':toDispenseBills}
+			del txdb['pending']['receiving'][theirAddress]
+			txdb.sync()
+			print "tried to perform a failed receiving tx from earlier. it succeeded"
+		else:
+			print "tried to perform a failed receiving tx from earlier. it failed again"
+			print "will try again in 120 seconds"
+			
+	for theirAddress, v in txdb['pending']['sending'].items():
+		tx = processSendBitcoin(ourPrivateKey, theirAddress, v['bitcoinOwed'])
+		if tx:
+			del txdb['pending']['sending'][theirAddress]
+			print "tried to perform a failed sending tx from earlier. it succeeded"
+		else:
+			print "tried to perform a failed sending tx from earlier. it failed again"
+			print "will try again in 120 seconds"
+	processPendingTx_thread = Timer(60, processPendingTx) # do this again later
+	processPendingTx_thread.daemon = True
+	processPendingTx_thread.start()
 
 def processSendBitcoin(fromPrivateKey, toPublicKey, amountOfBitcoin):
 	bcip = BlockchainInfoProvider("BTC")
-	amountOfSatoshi = amountOfBitcoin * 100000000
+	amountOfSatoshi = int(amountOfBitcoin * 100000000)
 	spendables = spendables_for_address(wif2address(fromPrivateKey), "BTC")
 	try:
-		tx = create_signed_tx(spendables, [(toPublicKey, amountOfSatoshi), wif2address(fromPrivateKey)], [fromPrivateKey], 0.0004)
+		tx = create_signed_tx(spendables, [(toPublicKey, amountOfSatoshi), wif2address(fromPrivateKey)], [fromPrivateKey], tx_fee.TX_FEE_PER_THOUSAND_BYTES)
 	except Exception as e:
 		print "could not build transaction."
 		print e
@@ -344,6 +423,7 @@ def giveBTC(address):
 def acceptCash():
 	if cashAcceptorOn == True:
 		acceptCash_thread = Timer(0.2, acceptCash) # loop this function again in a bit
+		acceptCash_thread.daemon = True
 		acceptCash_thread.start()
 		SSPinterpret()
 	else:
